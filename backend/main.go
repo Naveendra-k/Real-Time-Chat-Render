@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
+	_ "github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
 )
 
 // ============================================
-// Client
+// CLIENT
 // ============================================
 
 type Client struct {
@@ -25,7 +25,7 @@ type Client struct {
 }
 
 // ============================================
-// Chat Message
+// CHAT MESSAGE
 // ============================================
 
 type Message struct {
@@ -38,7 +38,7 @@ type Message struct {
 }
 
 // ============================================
-// Online / Offline Status Message
+// STATUS MESSAGE
 // ============================================
 
 type StatusMessage struct {
@@ -48,7 +48,17 @@ type StatusMessage struct {
 }
 
 // ============================================
-// Global Variables
+// DELIVERY UPDATE
+// ============================================
+
+type DeliveryUpdate struct {
+	Type      string `json:"type"`
+	MessageID int    `json:"messageId"`
+	Status    string `json:"status"`
+}
+
+// ============================================
+// GLOBAL VARIABLES
 // ============================================
 
 var (
@@ -63,41 +73,219 @@ var (
 		},
 	}
 
-	// Kafka Producer
-	kafkaWriter = &kafka.Writer{
-		Addr:     kafka.TCP("localhost:9092"),
-		Topic:    "chat-messages",
-		Balancer: &kafka.LeastBytes{},
+	kafkaWriter *kafka.Writer
+	kafkaReader *kafka.Reader
+)
+
+// ============================================
+// ENVIRONMENT VARIABLE
+// ============================================
+
+func getEnv(key string, defaultValue string) string {
+
+	value := os.Getenv(key)
+
+	if value == "" {
+		return defaultValue
 	}
 
-	// Kafka Consumer
-	kafkaReader = kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"localhost:9092"},
-		Topic:   "chat-messages",
-		GroupID: "connectify-chat-consumer",
-	})
-)
+	return value
+}
+
+// ============================================
+// DATABASE CONNECTION
+// ============================================
 
 func connectDatabase() {
 
 	var err error
 
-	// Change the password if your MySQL root password is different
-	dsn := "root:navee@123@tcp(localhost:3306)/connectify"
+	// Render DATABASE_URL
+	dsn := os.Getenv("DATABASE_URL")
 
-	db, err = sql.Open("mysql", dsn)
+	// Local PostgreSQL
+	if dsn == "" {
 
-	if err != nil {
-		log.Fatal("MySQL connection error:", err)
+		dsn = "postgres://postgres:Navee@123@localhost:5432/connectify?sslmode=disable"
+
+		log.Println(
+			"DATABASE_URL not found. Using local PostgreSQL.",
+		)
 	}
 
+	db, err = sql.Open(
+		"postgres",
+		dsn,
+	)
+
+	if err != nil {
+		log.Fatal(
+			"PostgreSQL connection error:",
+			err,
+		)
+	}
+
+	// Test connection
 	err = db.Ping()
 
 	if err != nil {
-		log.Fatal("MySQL ping error:", err)
+		log.Fatal(
+			"PostgreSQL ping error:",
+			err,
+		)
 	}
 
-	log.Println("MySQL Connected successfully")
+	// Show current database
+	var currentDB string
+
+	err = db.QueryRow(
+		"SELECT current_database()",
+	).Scan(&currentDB)
+
+	if err != nil {
+		log.Fatal(
+			"Could not get current database:",
+			err,
+		)
+	}
+
+	log.Println(
+		"Connected PostgreSQL database:",
+		currentDB,
+	)
+
+	// Show current schema
+	var currentSchema string
+
+	err = db.QueryRow(
+		"SELECT current_schema()",
+	).Scan(&currentSchema)
+
+	if err != nil {
+		log.Println(
+			"Could not get current schema:",
+			err,
+		)
+	} else {
+
+		log.Println(
+			"Connected PostgreSQL schema:",
+			currentSchema,
+		)
+	}
+
+	log.Println(
+		"PostgreSQL Connected successfully",
+	)
+
+	// ========================================
+	// CREATE TABLE AUTOMATICALLY
+	// ========================================
+
+	createChatTable()
+}
+
+// ============================================
+// CREATE CHAT TABLE
+// ============================================
+
+func createChatTable() {
+
+	query := `
+	CREATE TABLE IF NOT EXISTS public.chat_messages (
+
+		id SERIAL PRIMARY KEY,
+
+		sender VARCHAR(100) NOT NULL,
+
+		receiver VARCHAR(100) NOT NULL,
+
+		message TEXT NOT NULL,
+
+		timestamp TIMESTAMP NOT NULL,
+
+		status VARCHAR(20) DEFAULT 'sent'
+	);
+	`
+
+	_, err := db.Exec(query)
+
+	if err != nil {
+
+		log.Fatal(
+			"Could not create chat_messages table:",
+			err,
+		)
+	}
+
+	log.Println(
+		"PostgreSQL table chat_messages is ready",
+	)
+}
+
+// ============================================
+// KAFKA CONNECTION
+// ============================================
+
+func connectKafka() {
+
+	kafkaBroker := getEnv(
+		"KAFKA_BROKER",
+		"localhost:9092",
+	)
+
+	kafkaTopic := getEnv(
+		"KAFKA_TOPIC",
+		"chat-messages",
+	)
+
+	kafkaGroup := getEnv(
+		"KAFKA_GROUP",
+		"connectify-chat-consumer",
+	)
+
+	log.Println(
+		"Kafka Broker:",
+		kafkaBroker,
+	)
+
+	log.Println(
+		"Kafka Topic:",
+		kafkaTopic,
+	)
+
+	log.Println(
+		"Kafka Group:",
+		kafkaGroup,
+	)
+
+	// ========================================
+	// KAFKA PRODUCER
+	// ========================================
+
+	kafkaWriter = &kafka.Writer{
+		Addr:     kafka.TCP(kafkaBroker),
+		Topic:    kafkaTopic,
+		Balancer: &kafka.LeastBytes{},
+	}
+
+	// ========================================
+	// KAFKA CONSUMER
+	// ========================================
+
+	kafkaReader = kafka.NewReader(
+		kafka.ReaderConfig{
+			Brokers: []string{
+				kafkaBroker,
+			},
+			Topic:   kafkaTopic,
+			GroupID: kafkaGroup,
+		},
+	)
+
+	log.Println(
+		"Kafka connection configured",
+	)
 }
 
 // ============================================
@@ -106,35 +294,96 @@ func connectDatabase() {
 
 func main() {
 
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/ws", handleWebSocket)
-	http.HandleFunc("/history", historyHandler)
+	// ========================================
+	// ROUTES
+	// ========================================
 
-	// Serve frontend
-	http.Handle("/", http.FileServer(http.Dir("../frontend")))
+	http.HandleFunc(
+		"/health",
+		healthHandler,
+	)
 
-	port := os.Getenv("PORT")
+	http.HandleFunc(
+		"/ws",
+		handleWebSocket,
+	)
 
-	if port == "" {
-		port = "8080"
-	}
+	http.HandleFunc(
+		"/history",
+		historyHandler,
+	)
 
-	log.Println("================================")
-	log.Println("Connectify Chat Server")
-	log.Println("Port:", port)
-	log.Println("Kafka: localhost:9092")
-	log.Println("Topic: chat-messages")
-	log.Println("================================")
+	// ========================================
+	// SERVE FRONTEND
+	// ========================================
+
+	http.Handle(
+		"/",
+		http.FileServer(
+			http.Dir("../frontend"),
+		),
+	)
+
+	// ========================================
+	// RENDER PORT
+	// ========================================
+
+	port := getEnv(
+		"PORT",
+		"8080",
+	)
+
+	log.Println(
+		"================================",
+	)
+
+	log.Println(
+		"Connectify Chat Server",
+	)
+
+	log.Println(
+		"Port:",
+		port,
+	)
+
+	log.Println(
+		"================================",
+	)
+
+	// ========================================
+	// DATABASE
+	// ========================================
 
 	connectDatabase()
 
-	// Start Kafka Consumer
+	// ========================================
+	// KAFKA
+	// ========================================
+
+	connectKafka()
+
+	// ========================================
+	// START KAFKA CONSUMER
+	// ========================================
+
 	go startKafkaConsumer()
 
-	// Start HTTP + WebSocket Server
-	err := http.ListenAndServe(":"+port, nil)
+	// ========================================
+	// START SERVER
+	// ========================================
+
+	log.Println(
+		"Server starting on port:",
+		port,
+	)
+
+	err := http.ListenAndServe(
+		"0.0.0.0:"+port,
+		nil,
+	)
 
 	if err != nil {
+
 		log.Fatal(err)
 	}
 }
@@ -143,32 +392,72 @@ func main() {
 // HEALTH CHECK
 // ============================================
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+func healthHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(
+		http.StatusOK,
+	)
 
-	w.Write([]byte("Chat server is running"))
+	w.Write(
+		[]byte(
+			"Connectify Chat Server is running",
+		),
+	)
 }
 
-func historyHandler(w http.ResponseWriter, r *http.Request) {
+// ============================================
+// CHAT HISTORY
+// ============================================
 
-	sender := r.URL.Query().Get("sender")
-	receiver := r.URL.Query().Get("receiver")
+func historyHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+
+	sender := r.URL.Query().Get(
+		"sender",
+	)
+
+	receiver := r.URL.Query().Get(
+		"receiver",
+	)
 
 	if sender == "" || receiver == "" {
-		http.Error(w, "sender and receiver are required", http.StatusBadRequest)
+
+		http.Error(
+			w,
+			"sender and receiver are required",
+			http.StatusBadRequest,
+		)
+
 		return
 	}
 
-	rows, err := db.Query(`
-		SELECT id, sender, receiver, message, timestamp, status
-		FROM chat_messages
+	log.Printf(
+		"Loading history: %s ↔ %s",
+		sender,
+		receiver,
+	)
+
+	rows, err := db.Query(
+		`
+		SELECT
+			id,
+			sender,
+			receiver,
+			message,
+			timestamp,
+			status
+		FROM public.chat_messages
 		WHERE
-			(sender = ? AND receiver = ?)
+			(sender = $1 AND receiver = $2)
 			OR
-			(sender = ? AND receiver = ?)
+			(sender = $3 AND receiver = $4)
 		ORDER BY id ASC
-	`,
+		`,
 		sender,
 		receiver,
 		receiver,
@@ -176,14 +465,24 @@ func historyHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
-		log.Println("History query error:", err)
-		http.Error(w, "Failed to load history", http.StatusInternalServerError)
+
+		log.Println(
+			"History query error:",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load history",
+			http.StatusInternalServerError,
+		)
+
 		return
 	}
 
 	defer rows.Close()
 
-	var history []Message
+	history := []Message{}
 
 	for rows.Next() {
 
@@ -199,52 +498,99 @@ func historyHandler(w http.ResponseWriter, r *http.Request) {
 		)
 
 		if err != nil {
-			log.Println("History scan error:", err)
+
+			log.Println(
+				"History scan error:",
+				err,
+			)
+
 			continue
 		}
 
-		history = append(history, message)
+		history = append(
+			history,
+			message,
+		)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	if err := rows.Err(); err != nil {
 
-	json.NewEncoder(w).Encode(history)
+		log.Println(
+			"History rows error:",
+			err,
+		)
+	}
+
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
+	json.NewEncoder(w).Encode(
+		history,
+	)
 }
 
 // ============================================
 // WEBSOCKET HANDLER
 // ============================================
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+func handleWebSocket(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 
-	username := r.URL.Query().Get("username")
-	receiver := r.URL.Query().Get("receiver")
+	username := r.URL.Query().Get(
+		"username",
+	)
+
+	receiver := r.URL.Query().Get(
+		"receiver",
+	)
 
 	if username == "" {
+
 		username = "User"
 	}
 
 	if receiver == "" {
+
 		receiver = "User"
 	}
 
-	// Upgrade HTTP connection to WebSocket
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// ========================================
+	// UPGRADE TO WEBSOCKET
+	// ========================================
+
+	conn, err := upgrader.Upgrade(
+		w,
+		r,
+		nil,
+	)
 
 	if err != nil {
-		log.Println("WebSocket upgrade error:", err)
+
+		log.Println(
+			"WebSocket upgrade error:",
+			err,
+		)
+
 		return
 	}
 
-	// Create client
+	// ========================================
+	// CREATE CLIENT
+	// ========================================
+
 	client := &Client{
 		Conn:     conn,
 		Username: username,
 	}
 
-	// Add client
 	clientsMu.Lock()
+
 	clients[client] = true
+
 	clientsMu.Unlock()
 
 	log.Printf(
@@ -254,24 +600,33 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// ========================================
-	// STEP 8
 	// USER ONLINE
 	// ========================================
 
-	broadcastStatus(username, "online")
+	broadcastStatus(
+		username,
+		"online",
+	)
 
 	// ========================================
-	// USER DISCONNECT
+	// DISCONNECT
 	// ========================================
 
 	defer func() {
 
 		clientsMu.Lock()
-		delete(clients, client)
+
+		delete(
+			clients,
+			client,
+		)
+
 		clientsMu.Unlock()
 
-		// Notify other users
-		broadcastStatus(username, "offline")
+		broadcastStatus(
+			username,
+			"offline",
+		)
 
 		conn.Close()
 
@@ -279,11 +634,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			"User disconnected:",
 			username,
 		)
-
 	}()
 
 	// ========================================
-	// READ MESSAGES FROM WEBSOCKET
+	// READ MESSAGES
 	// ========================================
 
 	for {
@@ -317,10 +671,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Set sender and receiver from connection
+		// ====================================
+		// SET MESSAGE INFORMATION
+		// ====================================
+
 		message.Sender = username
+
 		message.Receiver = receiver
-		message.Timestamp = time.Now().Format("03:04 PM")
+
+		message.Timestamp =
+			time.Now().Format(
+				"2006-01-02 15:04:05",
+			)
+
 		message.Status = "sent"
 
 		log.Printf(
@@ -330,8 +693,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			message.Message,
 		)
 
-		// Send message to Kafka
-		sendToKafka(message)
+		// ====================================
+		// SEND TO KAFKA
+		// ====================================
+
+		sendToKafka(
+			message,
+		)
 	}
 }
 
@@ -339,9 +707,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // KAFKA PRODUCER
 // ============================================
 
-func sendToKafka(message Message) {
+func sendToKafka(
+	message Message,
+) {
 
-	data, err := json.Marshal(message)
+	data, err := json.Marshal(
+		message,
+	)
 
 	if err != nil {
 
@@ -379,20 +751,22 @@ func sendToKafka(message Message) {
 }
 
 // ============================================
-// STEP 7
 // KAFKA CONSUMER
-// Kafka → WebSocket
+// Kafka → PostgreSQL → WebSocket
 // ============================================
 
 func startKafkaConsumer() {
 
-	log.Println("Kafka Consumer started")
+	log.Println(
+		"Kafka Consumer started",
+	)
 
 	for {
 
-		message, err := kafkaReader.ReadMessage(
-			context.Background(),
-		)
+		message, err :=
+			kafkaReader.ReadMessage(
+				context.Background(),
+			)
 
 		if err != nil {
 
@@ -433,52 +807,75 @@ func startKafkaConsumer() {
 			chatMessage.Message,
 		)
 
-		messageID := saveMessageToDatabase(chatMessage)
+		// ====================================
+		// SAVE TO POSTGRESQL
+		// ====================================
+
+		messageID :=
+			saveMessageToDatabase(
+				chatMessage,
+			)
 
 		if messageID == 0 {
+
 			continue
 		}
 
 		chatMessage.ID = messageID
 
-		// Send message to sender and receiver
-		sendToReceiver(chatMessage)
+		// ====================================
+		// SEND TO CLIENTS
+		// ====================================
+
+		sendToReceiver(
+			chatMessage,
+		)
 	}
 }
 
 // ============================================
-// SAVE CHAT MESSAGE TO MYSQL
+// SAVE MESSAGE TO POSTGRESQL
 // ============================================
 
-func saveMessageToDatabase(message Message) int {
+func saveMessageToDatabase(
+	message Message,
+) int {
 
-	result, err := db.Exec(
-		`INSERT INTO chat_messages
-		(sender, receiver, message, timestamp, status)
-		VALUES (?, ?, ?, ?, ?)`,
+	var messageID int
+
+	err := db.QueryRow(
+		`
+		INSERT INTO public.chat_messages
+		(
+			sender,
+			receiver,
+			message,
+			timestamp,
+			status
+		)
+		VALUES
+		(
+			$1,
+			$2,
+			$3,
+			$4,
+			$5
+		)
+		RETURNING id
+		`,
 		message.Sender,
 		message.Receiver,
 		message.Message,
 		message.Timestamp,
 		message.Status,
+	).Scan(
+		&messageID,
 	)
 
 	if err != nil {
 
 		log.Println(
-			"MySQL save error:",
-			err,
-		)
-
-		return 0
-	}
-
-	id, err := result.LastInsertId()
-
-	if err != nil {
-
-		log.Println(
-			"LastInsertId error:",
+			"PostgreSQL save error:",
 			err,
 		)
 
@@ -486,22 +883,26 @@ func saveMessageToDatabase(message Message) int {
 	}
 
 	log.Printf(
-		"Message saved to MySQL: ID=%d %s → %s",
-		id,
+		"Message saved to PostgreSQL: ID=%d %s → %s",
+		messageID,
 		message.Sender,
 		message.Receiver,
 	)
 
-	return int(id)
+	return messageID
 }
 
 // ============================================
-// SEND MESSAGE TO WEBSOCKET CLIENTS
+// SEND MESSAGE TO CLIENTS
 // ============================================
 
-func sendToReceiver(message Message) {
+func sendToReceiver(
+	message Message,
+) {
 
-	data, err := json.Marshal(message)
+	data, err := json.Marshal(
+		message,
+	)
 
 	if err != nil {
 
@@ -514,11 +915,11 @@ func sendToReceiver(message Message) {
 	}
 
 	clientsMu.Lock()
+
 	defer clientsMu.Unlock()
 
 	for client := range clients {
 
-		// Send to sender and receiver
 		if client.Username == message.Receiver ||
 			client.Username == message.Sender {
 
@@ -535,7 +936,11 @@ func sendToReceiver(message Message) {
 				)
 
 				client.Conn.Close()
-				delete(clients, client)
+
+				delete(
+					clients,
+					client,
+				)
 
 				continue
 			}
@@ -545,11 +950,9 @@ func sendToReceiver(message Message) {
 				client.Username,
 			)
 
-			// ====================================
-			// RECEIVER GOT THE MESSAGE
-			// ====================================
-
-			if client.Username == message.Receiver {
+			// Receiver received message
+			if client.Username ==
+				message.Receiver {
 
 				go markMessageDelivered(
 					message.ID,
@@ -558,12 +961,21 @@ func sendToReceiver(message Message) {
 		}
 	}
 }
-func markMessageDelivered(messageID int) {
+
+// ============================================
+// MARK MESSAGE DELIVERED
+// ============================================
+
+func markMessageDelivered(
+	messageID int,
+) {
 
 	_, err := db.Exec(
-		`UPDATE chat_messages
+		`
+		UPDATE public.chat_messages
 		SET status = 'delivered'
-		WHERE id = ?`,
+		WHERE id = $1
+		`,
 		messageID,
 	)
 
@@ -582,17 +994,18 @@ func markMessageDelivered(messageID int) {
 		messageID,
 	)
 
-	// Send delivery update to sender
-	sendDeliveryUpdate(messageID)
+	sendDeliveryUpdate(
+		messageID,
+	)
 }
 
-func sendDeliveryUpdate(messageID int) {
+// ============================================
+// SEND DELIVERY UPDATE
+// ============================================
 
-	type DeliveryUpdate struct {
-		Type      string `json:"type"`
-		MessageID int    `json:"messageId"`
-		Status    string `json:"status"`
-	}
+func sendDeliveryUpdate(
+	messageID int,
+) {
 
 	update := DeliveryUpdate{
 		Type:      "delivery",
@@ -600,7 +1013,9 @@ func sendDeliveryUpdate(messageID int) {
 		Status:    "delivered",
 	}
 
-	data, err := json.Marshal(update)
+	data, err := json.Marshal(
+		update,
+	)
 
 	if err != nil {
 
@@ -613,6 +1028,7 @@ func sendDeliveryUpdate(messageID int) {
 	}
 
 	clientsMu.Lock()
+
 	defer clientsMu.Unlock()
 
 	for client := range clients {
@@ -633,11 +1049,13 @@ func sendDeliveryUpdate(messageID int) {
 }
 
 // ============================================
-// STEP 8
 // ONLINE / OFFLINE STATUS
 // ============================================
 
-func broadcastStatus(username string, status string) {
+func broadcastStatus(
+	username string,
+	status string,
+) {
 
 	data, err := json.Marshal(
 		StatusMessage{
@@ -658,6 +1076,7 @@ func broadcastStatus(username string, status string) {
 	}
 
 	clientsMu.Lock()
+
 	defer clientsMu.Unlock()
 
 	for client := range clients {
@@ -676,7 +1095,10 @@ func broadcastStatus(username string, status string) {
 
 			client.Conn.Close()
 
-			delete(clients, client)
+			delete(
+				clients,
+				client,
+			)
 
 			continue
 		}
