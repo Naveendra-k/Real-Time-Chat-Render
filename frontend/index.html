@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Connectify Chat</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div class="chat-container">
+
+        <div class="chat-header">
+            <div class="profile">
+                <div class="avatar">C</div>
+
+                <div>
+                    <h3>Connectify</h3>
+                    <span id="status">Connecting...</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div class="message-input">
+
+            <input
+                type="text"
+                id="messageInput"
+                placeholder="Type a message..."
+                autocomplete="off"
+            >
+
+            <button id="sendButton">
+                ➤
+            </button>
+
+        </div>
+
+    </div>
+
+    <script src="app.js"></script>
+
+</body>
+</html>
