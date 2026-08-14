@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl/scram"
 )
 
 // ============================================
@@ -82,7 +86,6 @@ var (
 // ============================================
 
 func getEnv(key string, defaultValue string) string {
-
 	value := os.Getenv(key)
 
 	if value == "" {
@@ -97,15 +100,12 @@ func getEnv(key string, defaultValue string) string {
 // ============================================
 
 func connectDatabase() {
-
 	var err error
 
-	// Render DATABASE_URL
 	dsn := os.Getenv("DATABASE_URL")
 
-	// Local PostgreSQL
+	// Local PostgreSQL fallback
 	if dsn == "" {
-
 		dsn = "postgres://postgres:Navee@123@localhost:5432/connectify?sslmode=disable"
 
 		log.Println(
@@ -167,7 +167,6 @@ func connectDatabase() {
 			err,
 		)
 	} else {
-
 		log.Println(
 			"Connected PostgreSQL schema:",
 			currentSchema,
@@ -178,10 +177,7 @@ func connectDatabase() {
 		"PostgreSQL Connected successfully",
 	)
 
-	// ========================================
-	// CREATE TABLE AUTOMATICALLY
-	// ========================================
-
+	// Create table
 	createChatTable()
 }
 
@@ -190,7 +186,6 @@ func connectDatabase() {
 // ============================================
 
 func createChatTable() {
-
 	query := `
 	CREATE TABLE IF NOT EXISTS public.chat_messages (
 
@@ -211,7 +206,6 @@ func createChatTable() {
 	_, err := db.Exec(query)
 
 	if err != nil {
-
 		log.Fatal(
 			"Could not create chat_messages table:",
 			err,
@@ -224,7 +218,66 @@ func createChatTable() {
 }
 
 // ============================================
+// KAFKA TLS CONFIGURATION
+// ============================================
+
+func createKafkaTLSConfig() *tls.Config {
+	caPath := os.Getenv(
+		"KAFKA_CA_CERT_PATH",
+	)
+
+	if caPath == "" {
+		caPath = "ca.pem"
+	}
+
+	caData, err := os.ReadFile(caPath)
+
+	if err != nil {
+
+		log.Printf(
+			"CA certificate not found at %s.",
+			caPath,
+		)
+
+		log.Println(
+			"Using system CA certificates.",
+		)
+
+		return &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	rootCAs, err := x509.SystemCertPool()
+
+	if err != nil {
+		log.Println(
+			"Could not load system certificate pool:",
+			err,
+		)
+
+		rootCAs = x509.NewCertPool()
+	}
+
+	if !rootCAs.AppendCertsFromPEM(caData) {
+		log.Fatal(
+			"Could not add Aiven CA certificate",
+		)
+	}
+
+	log.Println(
+		"Aiven CA certificate loaded successfully",
+	)
+
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    rootCAs,
+	}
+}
+
+// ============================================
 // KAFKA CONNECTION
+// Aiven Kafka + SASL/SCRAM-SHA-512 + TLS
 // ============================================
 
 func connectKafka() {
@@ -244,6 +297,14 @@ func connectKafka() {
 		"connectify-chat-consumer",
 	)
 
+	kafkaUsername := os.Getenv(
+		"KAFKA_USERNAME",
+	)
+
+	kafkaPassword := os.Getenv(
+		"KAFKA_PASSWORD",
+	)
+
 	log.Println(
 		"Kafka Broker:",
 		kafkaBroker,
@@ -260,6 +321,81 @@ func connectKafka() {
 	)
 
 	// ========================================
+	// LOCAL KAFKA MODE
+	// ========================================
+
+	if kafkaUsername == "" || kafkaPassword == "" {
+
+		log.Println(
+			"Kafka SASL credentials not found.",
+		)
+
+		log.Println(
+			"Using local Kafka connection.",
+		)
+
+		kafkaWriter = &kafka.Writer{
+			Addr:     kafka.TCP(kafkaBroker),
+			Topic:    kafkaTopic,
+			Balancer: &kafka.LeastBytes{},
+		}
+
+		kafkaReader = kafka.NewReader(
+			kafka.ReaderConfig{
+				Brokers: []string{
+					kafkaBroker,
+				},
+				Topic:   kafkaTopic,
+				GroupID: kafkaGroup,
+			},
+		)
+
+		log.Println(
+			"Local Kafka connection configured",
+		)
+
+		return
+	}
+
+	// ========================================
+	// AIVEN SASL/SCRAM-SHA-512
+	// ========================================
+
+	saslMechanism, err := scram.Mechanism(
+		scram.SHA512,
+		kafkaUsername,
+		kafkaPassword,
+	)
+
+	if err != nil {
+		log.Fatal(
+			"Kafka SASL configuration error:",
+			err,
+		)
+	}
+
+	log.Println(
+		"Kafka SASL/SCRAM-SHA-512 enabled",
+	)
+
+	// ========================================
+	// TLS
+	// ========================================
+
+	tlsConfig := createKafkaTLSConfig()
+
+	// ========================================
+	// KAFKA DIALER
+	// ========================================
+
+	dialer := &kafka.Dialer{
+		Timeout:       10 * time.Second,
+		DualStack:     true,
+		SASLMechanism: saslMechanism,
+		TLS:           tlsConfig,
+	}
+
+	// ========================================
 	// KAFKA PRODUCER
 	// ========================================
 
@@ -267,6 +403,11 @@ func connectKafka() {
 		Addr:     kafka.TCP(kafkaBroker),
 		Topic:    kafkaTopic,
 		Balancer: &kafka.LeastBytes{},
+
+		Transport: &kafka.Transport{
+			TLS:  tlsConfig,
+			SASL: saslMechanism,
+		},
 	}
 
 	// ========================================
@@ -278,13 +419,16 @@ func connectKafka() {
 			Brokers: []string{
 				kafkaBroker,
 			},
+
 			Topic:   kafkaTopic,
 			GroupID: kafkaGroup,
+
+			Dialer: dialer,
 		},
 	)
 
 	log.Println(
-		"Kafka connection configured",
+		"Aiven Kafka connection configured successfully",
 	)
 }
 
@@ -383,7 +527,6 @@ func main() {
 	)
 
 	if err != nil {
-
 		log.Fatal(err)
 	}
 }
@@ -549,12 +692,10 @@ func handleWebSocket(
 	)
 
 	if username == "" {
-
 		username = "User"
 	}
 
 	if receiver == "" {
-
 		receiver = "User"
 	}
 
@@ -711,6 +852,15 @@ func sendToKafka(
 	message Message,
 ) {
 
+	if kafkaWriter == nil {
+
+		log.Println(
+			"Kafka writer is not initialized",
+		)
+
+		return
+	}
+
 	data, err := json.Marshal(
 		message,
 	)
@@ -775,6 +925,10 @@ func startKafkaConsumer() {
 				err,
 			)
 
+			time.Sleep(
+				2 * time.Second,
+			)
+
 			continue
 		}
 
@@ -817,7 +971,6 @@ func startKafkaConsumer() {
 			)
 
 		if messageID == 0 {
-
 			continue
 		}
 
@@ -1110,4 +1263,86 @@ func broadcastStatus(
 			status,
 		)
 	}
+}
+
+// ============================================
+// OPTIONAL CONNECTION TEST
+// ============================================
+
+// This function is not required for normal operation.
+// It can be used later if you want to explicitly
+// test the Kafka broker connection.
+
+func testKafkaConnection() {
+
+	broker := os.Getenv("KAFKA_BROKER")
+
+	if broker == "" {
+		log.Println(
+			"KAFKA_BROKER not configured",
+		)
+
+		return
+	}
+
+	username := os.Getenv("KAFKA_USERNAME")
+	password := os.Getenv("KAFKA_PASSWORD")
+
+	if username == "" || password == "" {
+		log.Println(
+			"Kafka credentials not configured",
+		)
+
+		return
+	}
+
+	mechanism, err := scram.Mechanism(
+		scram.SHA512,
+		username,
+		password,
+	)
+
+	if err != nil {
+		log.Println(
+			"Kafka SCRAM error:",
+			err,
+		)
+
+		return
+	}
+
+	tlsConfig := createKafkaTLSConfig()
+
+	dialer := &kafka.Dialer{
+		Timeout:       10 * time.Second,
+		DualStack:     true,
+		SASLMechanism: mechanism,
+		TLS:           tlsConfig,
+	}
+
+	conn, err := dialer.Dial(
+		"tcp",
+		broker,
+	)
+
+	if err != nil {
+
+		log.Println(
+			"Kafka connection test failed:",
+			err,
+		)
+
+		return
+	}
+
+	defer conn.Close()
+
+	log.Println(
+		"Kafka connection test successful",
+	)
+
+	fmt.Println(
+		"Kafka broker:",
+		broker,
+	)
 }

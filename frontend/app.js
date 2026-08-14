@@ -1,30 +1,128 @@
+// ========================================
+// GET USERNAME AND RECEIVER
+// ========================================
+
 const params = new URLSearchParams(window.location.search);
 
-const username = params.get("username") || "User";
-const receiver = params.get("receiver") || "User";
+let username = params.get("username");
+let receiver = params.get("receiver");
 
-const socket = new WebSocket(
-    "ws://" +
+// If username is not provided in URL,
+// ask the user for it.
+
+if (!username) {
+    username = prompt("Enter your username:");
+
+    if (!username || username.trim() === "") {
+        username = "User";
+    }
+}
+
+// If receiver is not provided in URL,
+// ask the user for it.
+
+if (!receiver) {
+    receiver = prompt("Enter receiver username:");
+
+    if (!receiver || receiver.trim() === "") {
+        receiver = "User";
+    }
+}
+
+username = username.trim();
+receiver = receiver.trim();
+
+
+// ========================================
+// DISPLAY USER INFORMATION
+// ========================================
+
+console.log("================================");
+console.log("Connectify Chat");
+console.log("Username :", username);
+console.log("Receiver :", receiver);
+console.log("================================");
+
+
+// ========================================
+// WEBSOCKET URL
+// ========================================
+
+const protocol =
+    window.location.protocol === "https:"
+        ? "wss://"
+        : "ws://";
+
+const socketUrl =
+    protocol +
     window.location.host +
     "/ws?username=" +
     encodeURIComponent(username) +
     "&receiver=" +
-    encodeURIComponent(receiver)
-);
+    encodeURIComponent(receiver);
 
-const messageInput = document.getElementById("messageInput");
-const sendButton = document.getElementById("sendButton");
-const messages = document.getElementById("messages");
-const status = document.getElementById("status");
+console.log("WebSocket URL:", socketUrl);
 
 
 // ========================================
-// LOAD CHAT HISTORY FROM MYSQL
+// CREATE WEBSOCKET CONNECTION
+// ========================================
+
+const socket = new WebSocket(socketUrl);
+
+
+// ========================================
+// HTML ELEMENTS
+// ========================================
+
+const messageInput =
+    document.getElementById("messageInput");
+
+const sendButton =
+    document.getElementById("sendButton");
+
+const messages =
+    document.getElementById("messages");
+
+const status =
+    document.getElementById("status");
+
+
+// ========================================
+// CHECK HTML ELEMENTS
+// ========================================
+
+if (!messageInput) {
+    console.error("messageInput element not found");
+}
+
+if (!sendButton) {
+    console.error("sendButton element not found");
+}
+
+if (!messages) {
+    console.error("messages element not found");
+}
+
+if (!status) {
+    console.error("status element not found");
+}
+
+
+// ========================================
+// LOAD CHAT HISTORY FROM POSTGRESQL
 // ========================================
 
 async function loadChatHistory() {
 
     try {
+
+        console.log(
+            "Loading chat history:",
+            username,
+            "↔",
+            receiver
+        );
 
         const response = await fetch(
             "/history?sender=" +
@@ -40,12 +138,17 @@ async function loadChatHistory() {
             );
         }
 
-        const history = await response.json();
+        const history =
+            await response.json();
 
         console.log(
             "Chat history:",
             history
         );
+
+        // Clear existing messages before loading history
+
+        messages.innerHTML = "";
 
         history.forEach(function (data) {
 
@@ -88,11 +191,29 @@ async function loadChatHistory() {
 socket.onopen = function () {
 
     console.log(
-        "Connected as:",
+        "================================"
+    );
+
+    console.log(
+        "WebSocket connected successfully"
+    );
+
+    console.log(
+        "Username:",
         username
     );
 
-    status.textContent = "Online";
+    console.log(
+        "Receiver:",
+        receiver
+    );
+
+    console.log(
+        "================================"
+    );
+
+    status.textContent =
+        receiver + " Online";
 };
 
 
@@ -102,10 +223,11 @@ socket.onopen = function () {
 
 socket.onclose = function () {
 
-    status.textContent = "Offline";
+    status.textContent =
+        receiver + " Offline";
 
     console.log(
-        "Disconnected:",
+        "WebSocket disconnected:",
         username
     );
 };
@@ -122,7 +244,8 @@ socket.onerror = function (error) {
         error
     );
 
-    status.textContent = "Connection error";
+    status.textContent =
+        "Connection error";
 };
 
 
@@ -132,88 +255,121 @@ socket.onerror = function (error) {
 
 socket.onmessage = function (event) {
 
-    const data = JSON.parse(event.data);
+    try {
 
-    console.log(
-        "Received:",
-        data
-    );
-
-
-    // ====================================
-    // ONLINE / OFFLINE STATUS
-    // ====================================
-
-    if (data.type === "status") {
+        const data =
+            JSON.parse(event.data);
 
         console.log(
-            data.username,
-            "is",
-            data.status
+            "Received from server:",
+            data
         );
 
-        if (data.username === receiver) {
 
-            if (data.status === "online") {
+        // ====================================
+        // ONLINE / OFFLINE STATUS
+        // ====================================
 
-                status.textContent = "Online";
+        if (data.type === "status") {
 
-            } else if (data.status === "offline") {
+            console.log(
+                "User status:",
+                data.username,
+                data.status
+            );
 
-                status.textContent = "Offline";
+            if (
+                data.username === receiver
+            ) {
+
+                if (
+                    data.status === "online"
+                ) {
+
+                    status.textContent =
+                        receiver + " Online";
+
+                } else if (
+                    data.status === "offline"
+                ) {
+
+                    status.textContent =
+                        receiver + " Offline";
+                }
+            }
+
+            return;
+        }
+
+
+        // ====================================
+        // DELIVERY STATUS
+        // ====================================
+
+        if (data.type === "delivery") {
+
+            console.log(
+                "Message delivered:",
+                data.messageId
+            );
+
+            updateMessageStatus(
+                data.messageId,
+                data.status
+            );
+
+            return;
+        }
+
+
+        // ====================================
+        // CHAT MESSAGE
+        // ====================================
+
+        if (data.message) {
+
+            console.log(
+                "Chat message:",
+                data.sender,
+                "→",
+                data.receiver,
+                ":",
+                data.message
+            );
+
+            if (
+                data.sender === username
+            ) {
+
+                addMessage(
+                    data.message,
+                    "sent",
+                    data.timestamp,
+                    data.status,
+                    data.id
+                );
+
+            } else if (
+                data.sender === receiver &&
+                data.receiver === username
+            ) {
+
+                addMessage(
+                    data.message,
+                    "received",
+                    data.timestamp,
+                    data.status,
+                    data.id
+                );
             }
         }
 
-        return;
-    }
+    } catch (error) {
 
-
-    // ====================================
-    // DELIVERY STATUS
-    // ====================================
-
-    if (data.type === "delivery") {
-
-        console.log(
-            "Message delivered:",
-            data.messageId
+        console.error(
+            "WebSocket message parsing error:",
+            error
         );
-
-        updateMessageStatus(
-            data.messageId,
-            data.status
-        );
-
-        return;
-    }
-
-
-    // ====================================
-    // CHAT MESSAGE
-    // ====================================
-
-    if (data.message) {
-
-        if (data.sender === username) {
-
-            addMessage(
-                data.message,
-                "sent",
-                data.timestamp,
-                data.status,
-                data.id
-            );
-
-        } else {
-
-            addMessage(
-                data.message,
-                "received",
-                data.timestamp,
-                data.status,
-                data.id
-            );
-        }
     }
 };
 
@@ -227,10 +383,17 @@ function sendMessage() {
     const message =
         messageInput.value.trim();
 
+    // Don't send empty message
+
     if (message === "") {
+
         return;
     }
 
+
+    // ====================================
+    // CHECK WEBSOCKET CONNECTION
+    // ====================================
 
     if (
         socket.readyState !==
@@ -245,15 +408,39 @@ function sendMessage() {
     }
 
 
+    // ====================================
+    // MESSAGE DATA
+    // ====================================
+
     const data = {
+
         message: message
+
     };
 
+
+    console.log(
+        "Sending:",
+        username,
+        "→",
+        receiver,
+        ":",
+        message
+    );
+
+
+    // ====================================
+    // SEND TO GO SERVER
+    // ====================================
 
     socket.send(
         JSON.stringify(data)
     );
 
+
+    // ====================================
+    // CLEAR INPUT
+    // ====================================
 
     messageInput.value = "";
 
@@ -277,6 +464,10 @@ function addMessage(
         document.createElement("div");
 
 
+    // ====================================
+    // MESSAGE CLASS
+    // ====================================
+
     messageElement.classList.add(
         "message",
         type
@@ -287,7 +478,8 @@ function addMessage(
     // STORE MESSAGE ID
     // ====================================
 
-    if (messageId) {
+    if (messageId !== undefined &&
+        messageId !== null) {
 
         messageElement.dataset.messageId =
             messageId;
@@ -301,6 +493,10 @@ function addMessage(
     const textElement =
         document.createElement("span");
 
+    textElement.classList.add(
+        "message-text"
+    );
+
     textElement.textContent =
         message;
 
@@ -311,6 +507,10 @@ function addMessage(
 
     const timeElement =
         document.createElement("small");
+
+    timeElement.classList.add(
+        "message-time"
+    );
 
     timeElement.textContent =
         timestamp || "";
@@ -330,7 +530,10 @@ function addMessage(
 
     if (type === "sent") {
 
-        if (messageStatus === "delivered") {
+        if (
+            messageStatus ===
+            "delivered"
+        ) {
 
             statusElement.textContent =
                 "✓✓";
@@ -374,7 +577,7 @@ function addMessage(
 
 
     // ====================================
-    // ADD TO CHAT
+    // ADD MESSAGE TO CHAT
     // ====================================
 
     messages.appendChild(
@@ -382,7 +585,9 @@ function addMessage(
     );
 
 
-    // Scroll to latest message
+    // ====================================
+    // SCROLL TO LATEST MESSAGE
+    // ====================================
 
     messages.scrollTop =
         messages.scrollHeight;
@@ -390,7 +595,7 @@ function addMessage(
 
 
 // ========================================
-// UPDATE MESSAGE STATUS
+// UPDATE MESSAGE DELIVERY STATUS
 // ========================================
 
 function updateMessageStatus(
@@ -401,7 +606,7 @@ function updateMessageStatus(
     console.log(
         "Updating message:",
         messageId,
-        "to:",
+        "Status:",
         messageStatus
     );
 
@@ -432,14 +637,17 @@ function updateMessageStatus(
     if (!statusElement) {
 
         console.log(
-            "Status element not found"
+            "Message status element not found"
         );
 
         return;
     }
 
 
-    if (messageStatus === "delivered") {
+    if (
+        messageStatus ===
+        "delivered"
+    ) {
 
         statusElement.textContent =
             "✓✓";
@@ -448,29 +656,37 @@ function updateMessageStatus(
 
 
 // ========================================
-// SEND BUTTON
+// SEND BUTTON CLICK
 // ========================================
 
-sendButton.addEventListener(
-    "click",
-    sendMessage
-);
+if (sendButton) {
+
+    sendButton.addEventListener(
+        "click",
+        sendMessage
+    );
+}
 
 
 // ========================================
-// ENTER KEY
+// ENTER KEY TO SEND
 // ========================================
 
-messageInput.addEventListener(
-    "keydown",
-    function (event) {
+if (messageInput) {
 
-        if (event.key === "Enter") {
+    messageInput.addEventListener(
+        "keydown",
+        function (event) {
 
-            sendMessage();
+            if (event.key === "Enter") {
+
+                event.preventDefault();
+
+                sendMessage();
+            }
         }
-    }
-);
+    );
+}
 
 
 // ========================================
